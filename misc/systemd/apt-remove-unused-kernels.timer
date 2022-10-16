@@ -1,0 +1,12 @@
+[Unit]
+Description         = Daily remove unused kernel images
+Before              = apt-daily.service apt-daily-upgrade.service
+
+
+[Timer]
+OnCalendar          = *-*-* 05:00
+Persistent          = true
+
+
+[Install]
+WantedBy            = timers.target

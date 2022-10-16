@@ -1,0 +1,460 @@
+#!/usr/bin/perl
+# Script that reports or removes unused kernel packages on Debian systems.
+# 
+# Useful for cleaning up kernel images
+# without waiting for Debians "keep the last 2 kernels" autoremoval.
+#
+# The currently booted kernel will never be considered for uninstalling.
+# Additionally, this script will abort prior to reporting/removing any packages
+# if the package for the currently running kernel could not be identified.
+#
+# Example usage:
+#
+#  - Print unused kernel packages (without removing them)
+#
+#      apt-remove-unused-kernels
+#
+#  - Print and remove unused kernel packages
+#
+#      apt-removed-unused-kernels -u
+#
+package RemoveUnusedKernels::Main;
+
+use strict;
+use warnings;
+use feature qw( say );
+use English qw( -no_match_vars );
+use Carp qw( carp croak confess );
+
+use POSIX qw();
+
+use IPC::Cmd;
+
+# clean exit on keyboard interrupt
+use sigtrap qw( die INT );
+
+use Getopt::Long qw( :config posix_default bundling no_ignore_case );
+use File::Basename;
+
+use constant EXIT_SUCCESS      => 0;
+use constant EXIT_FAILURE      => 1;
+use constant EXIT_USAGE_ERROR  => 64;
+
+our $VERSION = 0.1;
+
+my $prog_name = File::Basename::basename($PROGRAM_NAME);
+
+
+# int main()
+#
+sub main {
+    my $opts = {};
+
+    # parse options
+    if ( ! main_get_opts($opts) ) {
+        printf {*STDERR} "Usage error: Type -h for help.\n";
+        return EXIT_USAGE_ERROR;
+
+    } elsif ( $opts->{'help'} ) {
+        main_print_help();
+        return EXIT_SUCCESS;
+
+    } elsif ( $opts->{'version'} ) {
+        main_print_version();
+        return EXIT_SUCCESS;
+
+    } else {
+        return main_unused_kernel_images ( $opts );
+    }
+}
+
+
+# int main_print_help ( [fh] )
+#
+sub main_print_help {
+    my $fh = shift // *STDOUT;
+
+    my $usage = <<"END_OF_USAGE";
+${prog_name} -- Report unused kernel packages
+
+Parameters:
+  -h            -- print this message and exit
+  -V            -- print script version and exit
+  -u            -- uninstall unused packages
+END_OF_USAGE
+
+    printf {$fh} "%s\n", $usage;
+    return 1;
+}
+
+
+# int main_print_version ( [fh] )
+#
+sub main_print_version {
+    my $fh = shift // *STDOUT;
+
+    printf {$fh} "%s\n", $VERSION;
+    return 1;
+}
+
+
+# int main_get_opts ( HashRef<str,*> opts, **ARGV! )
+#
+sub main_get_opts {
+    my $opts = shift or return;
+
+    my @options_def = (
+        'help|h',
+        'version|V',
+        'uninstall|u',
+    );
+
+    GetOptions ( $opts, @options_def ) or return;
+    if ( $opts->{'help'} ) { return 1; }
+    if ( $opts->{'version'} ) { return 1; }
+
+    # STUB: process cmdline options / args
+    
+    if ( scalar @ARGV ) {
+        printf {*STDERR} "Too many positional arguments.\n";
+        return;
+    }
+
+    return 1;
+}
+
+
+# int main_unused_kernel_images ( HashRef<str,*> opts, **ENV! )
+#
+#   Part of the main function that contains
+#   the actual "print/remove unused kernel" implementation.
+#
+#   Returns zero on success and aa non-zero exit code on error.
+#
+sub main_unused_kernel_images {
+    my $opts = shift or return;
+
+    my ($any_booted, $unused) = query_unused_kernel_images();
+
+    if ( ! defined $any_booted ) {
+        printf {*STDERR} "Booted kernel not found in package list, aborting.\n";
+        return EXIT_FAILURE;
+    }
+
+    # exit early if nothing to be done
+    if ( ! scalar @{ $unused } ) {
+        return EXIT_SUCCESS;
+    }
+
+    my @unused_names = sort (map { $_->PN; } @{ $unused });
+
+    if ( $opts->{'uninstall'} ) {
+        # uninstall mode : print booted + unused kernel packages w/ prefix, then uninstall
+
+        printf "Booted: %s\n", $any_booted->PN;
+        foreach my $pkg_name ( @unused_names ) {
+            printf "Removing: %s\n", $pkg_name;
+        }
+
+        if ( ! uninstall_packages ( \@unused_names ) ) {
+            return EXIT_FAILURE;
+        }
+
+    } else {
+        # list mode : print unused kernel packages
+        printf "%s\n", join "\n", @unused_names;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+# (RemoveUnusedKernels::KernelPackageInfo, ArrayRef<RemoveUnusedKernels::KernelPackageInfo>) query_unused_kernel_images()
+# ArrayRef<RemoveUnusedKernels::KernelPackageInfo> query_unused_kernel_images()
+#
+#   Queries dpkg for unused/used kernel packages.
+#
+#   In scalar context, returns an array (ref) of kernel package
+#   info objects that refer to unused kernel images.
+#   If no booted kernel was found, then undef is returned instead.
+#
+#   In list context, returns a package info pointing to a possibly
+#   booted kernel package as well as the array of unused kernel packages
+#   (as described in the scalar mode section).
+#   If no booted kernel was found, then the "possibly-booted" kernel info
+#   will be undef, but the unused packages array will still be populated.
+#   
+sub query_unused_kernel_images {
+    my ($sysname, $nodename, $release, $version, $machine) = POSIX::uname();
+    if ( ! $release ) {
+        printf {*STDERR} "Failed to get booted kernel release.\n";
+        return;
+    }
+
+    my $kpkg = RemoveUnusedKernels::Helpers::query_installed_kernel_packages ( $release )
+        or return;
+
+    my @unused;
+    # NOTE ignoring multiple matches for possibly booted kernel when reporting.
+    # No "possibly booted" candidate will be considered as unused.
+    my $any_booted;
+
+    foreach my $prefix ( keys %{ $kpkg } ) {
+        my $packages = $kpkg->{$prefix};
+
+        foreach my $pkg ( @{ $packages } ) {
+            if ( $pkg->booted ) {
+                $any_booted = $pkg;
+
+            } else {
+                push @unused, $pkg;
+            }
+        }
+    }
+
+    if ( wantarray ) {
+        return ($any_booted, \@unused);
+
+    } elsif ( defined $any_booted ) {
+        return \@unused;
+
+    } else {
+        return;
+    }
+}
+
+
+# int uninstall_packages ( ArrayRef<str> package_names )
+#
+#   Runs aptitude or apt-get to uninstall ("purge")
+#   the packages given by name.
+#
+#   aptitude will be preferred over apt-get if both are available.
+#
+#   Non-interactive mode is enforced as much as possible.
+#
+sub uninstall_packages {
+    my $packages = shift or return;
+    my $prog;
+    my @uninstall_cmdv;
+    my $status;
+
+    # prefer aptitude over apt-get
+    $prog = IPC::Cmd::can_run ( 'aptitude' );
+    if ( $prog ) {
+        @uninstall_cmdv = (
+            $prog,
+            '-vv',
+            '-y',
+            '--purge-unused',
+            'purge',
+        );
+
+    } else {
+        $prog = IPC::Cmd::can_run ( 'apt-get' );
+        if ( $prog ) {
+            @uninstall_cmdv = (
+                $prog,
+                '-y',
+                'purge',
+            );
+
+        } else {
+            printf {*STDERR} "Failed to locate aptitude/apt-get.\n";
+            return;
+        }
+    }
+
+    # non-interactive mode: debconf frontend
+    $ENV{'DEBIAN_FRONTEND'} = 'noninteractive';
+
+    # non-interactive mode: skip dpkg conf questions
+    push @uninstall_cmdv, ('-o', 'Dpkg::Options::=--force-confdef');
+    push @uninstall_cmdv, ('-o', 'Dpkg::Options::=--force-confold');
+
+    push @uninstall_cmdv, @{ $packages };
+
+    # non-interactive: run with empty stdin
+    local *STDIN;
+
+    open STDIN, '<', '/dev/null'
+        or croak "Failed to redirect stdin from /dev/null.\n";
+
+    $status = system {$prog} @uninstall_cmdv;
+
+    close STDIN;
+
+    # any non-zero status code indicates some kind of error
+    # (signal, exit code, ...)
+    if ( $status ) {
+        return;
+    }
+
+    return 1;
+}
+
+
+package RemoveUnusedKernels::Helpers;
+
+use strict;
+use warnings;
+use feature qw( say );
+use English qw( -no_match_vars );
+use Carp qw( carp croak confess );
+
+## use RemoveUnusedKernels::KernelPackageInfo;  ## not needed in multi-pkg file
+
+# HashRef<str,ArrayRef<RemoveUnusedKernels::KernelPackageInfo>> query_installed_kernel_packages ( [booted_uname] )
+#
+#   Retrieves all installed kernel packages
+#   from the dpkg database using dpkg-query(1).
+#
+#   Returns a hash that maps the package basename ("prefix")
+#   to an array (ref) of package info objects.
+#
+#   The optional booted_uname parameter should be a kernel package
+#   version of the currently booted kernel, if given.
+#   It will be used to mark kernel packages
+#   from the dpkg-query result as "possibly booted".
+#
+sub query_installed_kernel_packages {
+    my $booted_uname = shift // undef;  # may be undef
+
+    # kpkg : package name prefix => ArrayRef<RemoveUnusedKernels::KernelPackageInfo>
+    my %kpkg;
+    my $result;
+
+    my $output = qx(
+        dpkg-query --show \\
+        --showformat='\${db:Status-Abbrev}\\t\${Package}\\t\${Version}\\n'
+    );
+
+    # any non-zero status code indicates some kind of error
+    # (signal, exit code, ...)
+    if ( $? ) {
+        printf {*STDERR} "Failed to query package database.\n";
+    }
+
+    foreach my $line ( split "\n", $output ) {
+        my @fields = split "\t", $line;
+
+        if ( scalar @fields != 3 ) {
+            croak "Invalid dpkg-query line: ${line}";
+        }
+
+        my ($pkg_status, $pkg_name, $pkg_ver) = @fields;
+
+        # pkg_status should contain 3 items
+        # 1 - Desired action
+        # 2 - Package status
+        # 3 - Error flags
+        # (due to splitting, the third item may be missing)
+        #
+        # consider packages only if pkg_status indicates:
+        # 1 - Desired action = "i" (Install)
+        # 2 - Package Status = "i" (Installed)
+        # 3 - Error flags    = <empty>
+
+        if ( $pkg_status =~ qr/^ii\s*$/mx ) {
+            my ($uname, $pkg_prefix) = get_uname ( $pkg_name );
+
+            if ( $uname ) {
+                my $pkg_info = RemoveUnusedKernels::KernelPackageInfo->new (
+                    PN      => $fields[1],
+                    PVR     => $fields[2],
+                    uname   => $uname,
+                    booted  => ( ($booted_uname && ($booted_uname eq $uname)) ? 1 : 0 ),
+                );
+
+                if ( exists $kpkg{$pkg_prefix} ) {
+                    push @{ $kpkg{$pkg_prefix} }, $pkg_info;
+
+                } else {
+                    $kpkg{$pkg_prefix} = [$pkg_info];
+                }
+            }
+        }
+    }
+
+    return \%kpkg;
+}
+
+
+# str get_uname ( package_name )
+# (str, str) get_uname ( package_name )
+#
+#   Extracts the kernel version from a package name.
+#
+#   Returns undef if the given package name
+#   does not refer to a kernel package.
+#
+#   Otherwise, returns the kernel version string in scalar context
+#   and both the kernel package basename ("prefix")
+#   and the version string in list context.
+#
+#   This function tries to resemble the getUname() function
+#   from apt's internal implementation,
+#   https://salsa.debian.org/apt-team/apt/-/blob/f93a5aa2daa92255c75865b6f92dddb4b072ff33/apt-pkg/algorithms.cc#L1463-1497
+#
+our $RE_KPKG_PREFIXES = qr/^(?<prefix>(?:linux|kfreebsd|gnumach)-image-)(?<rem>.+)/mx;
+our $RE_KPKG_SUFFIXES_IGNORE = qr/-(?:dbgsym|dbg)$/mx;
+# rules from getUname():
+#   - version string length must be > 1
+#   - version string must start with a digit 0-9
+#   - first non-digit char in version string must be a dot char '.'
+our $RE_KPKG_VERSION = qr/^[0-9]+[.]/mx;
+
+sub get_uname {
+    my $package_name = shift;
+
+    # must start with a known kernel image package name prefix
+    if ( $package_name =~ $RE_KPKG_PREFIXES ) {
+        my $prefix = $+{'prefix'};
+        my $uname = $+{'rem'};
+
+        # filter out dbg/dbgsym packages
+        if ( $uname =~ $RE_KPKG_SUFFIXES_IGNORE ) {
+            return;
+
+        } elsif ( $uname =~ $RE_KPKG_VERSION ) {
+            if ( wantarray ) {
+                return ($uname, $prefix);
+
+            } else {
+                return $uname;
+            }
+        }
+
+    } else {
+        return;
+    }
+}
+
+
+1;
+
+
+package RemoveUnusedKernels::KernelPackageInfo;
+
+use strict;
+use warnings;
+use feature qw( say );
+use English qw( -no_match_vars );
+
+
+# KernelPackageInfo
+use Class::Struct 'RemoveUnusedKernels::KernelPackageInfo' => {
+    'PN'        => '$',     # package name
+    'PVR'       => '$',     # package version + revision
+    'uname'     => '$',     # parsed kernel version
+    'booted'    => '$'      # whether this is the currently used kernel image (or could be, at least)
+};
+
+
+1;
+
+
+# return to main script
+package RemoveUnusedKernels::Main;
+
+exit main();

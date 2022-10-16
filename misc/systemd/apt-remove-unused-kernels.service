@@ -1,0 +1,11 @@
+[Unit]
+Description         = Remove unused kernel images
+After               = network.target network-online.target
+Before              = apt-daily.service apt-daily-upgrade.service
+ConditionACPower    = yes
+
+
+[Service]
+Type                = oneshot
+ExecStart           = /usr/local/bin/apt-remove-unused-kernels -u
+TimeoutStopSec      = 900
