@@ -81,6 +81,7 @@ Parameters:
   -h            -- print this message and exit
   -V            -- print script version and exit
   -u            -- uninstall unused packages
+  -w <SEC>      -- when uninstalling, wait up to <SEC> seconds for dpkg lock
 END_OF_USAGE
 
     printf {$fh} "%s\n", $usage;
@@ -107,6 +108,7 @@ sub main_get_opts {
         'help|h',
         'version|V',
         'uninstall|u',
+        'wait-dpkg|w=i',
     );
 
     GetOptions ( $opts, @options_def ) or return;
@@ -156,7 +158,7 @@ sub main_unused_kernel_images {
             printf "Removing: %s\n", $pkg_name;
         }
 
-        if ( ! uninstall_packages ( \@unused_names ) ) {
+        if ( ! uninstall_packages ( \@unused_names, $opts->{'wait-dpkg'} ) ) {
             return EXIT_FAILURE;
         }
 
@@ -224,7 +226,7 @@ sub query_unused_kernel_images {
 }
 
 
-# int uninstall_packages ( ArrayRef<str> package_names )
+# int uninstall_packages ( ArrayRef<str> package_names, [int dpkg_timeout] )
 #
 #   Runs aptitude or apt-get to uninstall ("purge")
 #   the packages given by name.
@@ -233,8 +235,14 @@ sub query_unused_kernel_images {
 #
 #   Non-interactive mode is enforced as much as possible.
 #
+#   If dpkg_timeout is given, instruct aptitude/apt to wait up
+#   to <dpkg_timeout> seconds for other dpkg actions to finish.
+#   This requires apt >= 1.9.11, present in Debian 11 and above.
+#
 sub uninstall_packages {
     my $packages = shift or return;
+    my $dpkg_timeout = shift;  # may be undef
+
     my $prog;
     my @uninstall_cmdv;
     my $status;
@@ -271,6 +279,11 @@ sub uninstall_packages {
     # non-interactive mode: skip dpkg conf questions
     push @uninstall_cmdv, ('-o', 'Dpkg::Options::=--force-confdef');
     push @uninstall_cmdv, ('-o', 'Dpkg::Options::=--force-confold');
+
+    # wait for dpkg lock depending on dpkg_timeout parameter
+    if ( $dpkg_timeout ) {
+        push @uninstall_cmdv, ('-o', (sprintf 'Dpkg::Lock::Timeout=%d', $dpkg_timeout));
+    }
 
     push @uninstall_cmdv, @{ $packages };
 
